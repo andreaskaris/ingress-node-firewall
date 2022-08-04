@@ -88,13 +88,16 @@ func (r *IngressNodeFirewallNodeStateReconciler) SetupWithManager(mgr ctrl.Manag
 
 func (r *IngressNodeFirewallNodeStateReconciler) reconcileResource(
 	ctx context.Context, req ctrl.Request, instance *infv1alpha1.IngressNodeFirewallNodeState, isDelete bool) (ctrl.Result, error) {
-	if err := r.syncIngressNodeFirewallResources(instance, isDelete); err != nil {
+	if err := syncIngressNodeFirewallResources(r, instance, isDelete); err != nil {
 		return ctrl.Result{}, errors.Wrapf(err, "FailedToSyncIngressNodeFirewallResources")
 	}
 	return ctrl.Result{}, nil
 }
 
-func (r *IngressNodeFirewallNodeStateReconciler) syncIngressNodeFirewallResources(instance *infv1alpha1.IngressNodeFirewallNodeState, isDelete bool) error {
+// syncIngressNodeFirewallResources synchronizes rules from a provided IngressNodeFirewallNodeState to
+// the node's eBPF layer. Save this function in a var to make the controller mockable. Tests can thus
+// simply overwrite this var for unit tests.
+var syncIngressNodeFirewallResources = func(r *IngressNodeFirewallNodeStateReconciler, instance *infv1alpha1.IngressNodeFirewallNodeState, isDelete bool) error {
 	logger := r.Log.WithName("syncIngressNodeFirewallResources")
 	logger.Info("Start")
 
