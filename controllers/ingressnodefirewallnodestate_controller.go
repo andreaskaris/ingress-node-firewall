@@ -107,24 +107,27 @@ func (r *IngressNodeFirewallNodeStateReconciler) syncIngressNodeFirewallResource
 		return err
 	}
 
-	for _, rule := range instance.Spec.Ingress {
-		rule := rule.DeepCopy()
-		if err := addFailSaferules(&rule.FirewallProtocolRules); err != nil {
-			logger.Error(err, "Fail to load ingress firewall fail safe rules", "rule", rule)
-			return err
-		}
-		if err := c.IngressNodeFwRulesLoader(*rule, isDelete); err != nil {
-			logger.Error(err, "Fail to load ingress firewall rule", "rule", rule)
-			return err
+	ifList, err := c.IngressNodeFwAttach(*instance.Spec.Interfaces, isDelete)
+	if err != nil {
+		logger.Error(err, "Fail to attach ingress firewall prog")
+		return err
+	}
+	for _, ifId := range ifList {
+		for _, rule := range instance.Spec.Ingress {
+			rule := rule.DeepCopy()
+			if err := addFailSaferules(&rule.FirewallProtocolRules); err != nil {
+				logger.Error(err, "Fail to load ingress firewall fail safe rules", "rule", rule)
+				return err
+			}
+			if err := c.IngressNodeFwRulesLoader(*rule, isDelete, ifId); err != nil {
+				logger.Error(err, "Fail to load ingress firewall rule", "rule", rule)
+				return err
+			}
 		}
 	}
 
 	r.Stats.StartPoll(c.GetStatisticsMap())
 
-	if err := c.IngressNodeFwAttach(*instance.Spec.Interfaces, isDelete); err != nil {
-		logger.Error(err, "Fail to attach ingress firewall prog")
-		return err
-	}
 	return nil
 }
 
