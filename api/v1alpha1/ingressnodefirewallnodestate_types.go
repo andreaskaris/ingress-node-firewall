@@ -27,25 +27,30 @@ type IngressNodeFirewallNodeStateSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	// A list of ingress firewall policy rules.
+	// A map that matches interface names to ingress firewall policy rules that shall be applied on the given
+	// interface.
 	// empty list indicates no ingress firewall i.e allow all incoming traffic.
 	// +kubebuilder:validation:Optional
 	// +optional
-	Ingress []IngressNodeFirewallRules `json:"ingress"`
-
-	// A list of interfaces where the ingress firewall policy will be applied on.
-	// empty list indicates the firewall policy applied on all interfaces
-	// +kubebuilder:validation:Optional
-	// +optional
-	// +nullable
-	Interfaces *[]string `json:"interfaces"`
+	InterfaceIngressRules map[string][]IngressNodeFirewallRules `json:"ingress"`
 }
 
 // IngressNodeFirewallNodeStateStatus defines the observed state of IngressNodeFirewallNodeState
 type IngressNodeFirewallNodeStateStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	SyncStatus       IngressNodeFirewallNodeStateSyncStatus `json:"syncStatus,omitempty"`
+	SyncErrorMessage string                                 `json:"syncErrorMessage,omitempty"`
 }
+
+// IngressNodeFirewallNodeStateSyncStatus defines the various valid synchronization states for
+// IngressNodeFirewallNodeState.
+type IngressNodeFirewallNodeStateSyncStatus string
+
+var (
+	// SyncError indicates that the last synchronization attempt failed.
+	SyncError IngressNodeFirewallNodeStateSyncStatus = "Error"
+	// SyncError indicates that the last synchronization attempt was a success.
+	SyncOK IngressNodeFirewallNodeStateSyncStatus = "Synchronized"
+)
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
