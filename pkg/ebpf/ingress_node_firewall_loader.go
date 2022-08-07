@@ -28,7 +28,7 @@ type IngNodeFwController struct {
 	// eBPF objs to create/update eBPF maps
 	objs BpfObjects
 	// eBPF interfaces attachment objects
-	links []link.Link
+	links map[string]link.Link
 	// eBPF pingPath
 	pinPath string
 }
@@ -55,6 +55,7 @@ func NewIngNodeFwController() (*IngNodeFwController, error) {
 	return &IngNodeFwController{
 		objs:    objs,
 		pinPath: pinDir,
+		links:   make(map[string]link.Link),
 	}, nil
 }
 
@@ -225,11 +226,11 @@ func (infc *IngNodeFwController) IngressNodeFwAttach(ifacesName []string, isDele
 			if err := l.Pin(lPinDir); err != nil {
 				return ifIdlist, fmt.Errorf("failed to pin link to pinDir %s: %s", lPinDir, err)
 			}
-			infc.links = append(infc.links, l)
+			infc.links[ifaceName] = l
 			log.Printf("Attached IngressNode Firewall program to iface %q (index %d)", iface.Name, iface.Index)
 		} else {
 			log.Printf("Unattaching IngressNode Firewall program from iface %q (index %d)", iface.Name, iface.Index)
-			infc.cleanup()
+			infc.cleanupInterface(ifaceName)
 		}
 	}
 	return ifIdlist, nil
@@ -245,4 +246,31 @@ func (infc *IngNodeFwController) cleanup() {
 		l.Close()
 	}
 	infc.objs.Close()
+}
+
+// cleanupInterface will delete a given interface's link object.
+func (infc *IngNodeFwController) cleanupInterface(ifaceName string) {
+	l, ok := infc.links[ifaceName]
+	if !ok {
+		log.Printf("Link not found %q", ifaceName)
+		return
+	}
+	if err := l.Unpin(); err != nil {
+		log.Printf("Failed unpin link %v err %v", l, err)
+	}
+	l.Close()
+}
+
+// Unpin removes a pin for the given ifaceName. Return nil if the unpin operation succeeded. In that case, either
+// a pin could be deleted from the filesystem, or no pin was found. Return error in any other case.
+func (infc *IngNodeFwController) Unpin(ifaceName string) error {
+	pinnedPath := path.Join(infc.pinPath, ifaceName+"_link")
+	if pinnedPath == "" {
+		return nil
+	}
+	err := os.Remove(pinnedPath)
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }

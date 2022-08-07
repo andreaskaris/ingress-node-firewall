@@ -3,6 +3,7 @@ package ebpfsyncer
 import (
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"sync"
 
@@ -17,8 +18,8 @@ var once sync.Once
 var instance EbpfSyncer
 
 // ebpfDaemon is a single point of contact that all reconciliation requests will send their desired state of
-// interface rules to. On the other side, ebpfDaemon allocates IngNodeFwControllers for the various interfaces
-// and makes sure that rules are attached and detached from / to the host's interfaces.
+// interface rules to. On the other side, ebpfDaemon makes sure that rules are attached and detached from / to the
+// host's interfaces.
 type EbpfSyncer interface {
 	SyncInterfaceIngressRules(map[string][]infv1alpha1.IngressNodeFirewallRules, bool) error
 }
@@ -27,13 +28,21 @@ type EbpfSyncer interface {
 // it sets up a new one. It will do so only once. Then, it returns the instance.
 func GetEbpfSyncer(ctx context.Context, log logr.Logger, stats *metrics.Statistics, mock EbpfSyncer) EbpfSyncer {
 	once.Do(func() {
-		// Check if instace is nil. For mock tests, one can provide a custom instance.
+		// Check if instance is nil. For mock tests, one can provide a custom instance.
 		if mock == nil {
+			c, err := nodefwloader.NewIngNodeFwController()
+			if err != nil {
+				// TODO: Extremely unelegant. Fix this.
+				panic(fmt.Errorf("Failed to create nodefw controller instance, err: %q", err))
+			}
+
 			instance = &ebpfSingleton{
-				ctx:                   ctx,
-				log:                   log,
-				stats:                 stats,
-				ifFirewallControllers: make(map[string]*nodefwloader.IngNodeFwController)}
+				ctx:               ctx,
+				log:               log,
+				stats:             stats,
+				managedInterfaces: make(map[string]struct{}),
+				c:                 c,
+			}
 		} else {
 			instance = mock
 		}
@@ -43,11 +52,12 @@ func GetEbpfSyncer(ctx context.Context, log logr.Logger, stats *metrics.Statisti
 
 // ebpfSingleton implements ebpfDaemon.
 type ebpfSingleton struct {
-	ctx                   context.Context
-	log                   logr.Logger
-	stats                 *metrics.Statistics
-	ifFirewallControllers map[string]*nodefwloader.IngNodeFwController
-	mu                    sync.Mutex
+	ctx               context.Context
+	log               logr.Logger
+	stats             *metrics.Statistics
+	managedInterfaces map[string]struct{}
+	c                 *nodefwloader.IngNodeFwController
+	mu                sync.Mutex
 }
 
 // syncInterfaceIngressRules takes a map of <interfaceName>:<interfaceRules> and a boolean parameter that indicates
@@ -55,47 +65,82 @@ type ebpfSingleton struct {
 // If isDelete is true then all rules will be attached from all provided interfaces. In such a case, the given
 // intefaceRules (if any) will be ignored.
 // If isDelete is false then rules will be synchronized for each of the given interfaces.
-func (r *ebpfSingleton) SyncInterfaceIngressRules(
+func (e *ebpfSingleton) SyncInterfaceIngressRules(
 	ifaceIngressRules map[string][]infv1alpha1.IngressNodeFirewallRules, isDelete bool) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-	logger := r.log.WithName("syncIngressNodeFirewallResources")
-	logger.Info("Start")
+	logger := e.log.WithName("SyncInterfaceIngressRules")
+	logger.Info("Starting sync operation")
 
-	if r.stats != nil {
-		r.stats.StopPoll()
+	if e.stats != nil {
+		e.stats.StopPoll()
 	}
 
-	c, err := nodefwloader.NewIngNodeFwController()
-	if err != nil {
-		logger.Error(err, "Fail to create nodefw controller instance")
-		return err
-	}
-
-	for iface, rules := range ifaceIngressRules {
-		ifList, err := c.IngressNodeFwAttach([]string{iface}, isDelete)
-		if err != nil {
-			logger.Error(err, "Fail to attach ingress firewall prog")
-			return err
+	for ifaceName, rules := range ifaceIngressRules {
+		var ifID uint32
+		// Check if the interface is currently managed by us.
+		_, ok := e.managedInterfaces[ifaceName]
+		// If an interface is not managed yet, add it to the list of managed interfaces.
+		// Then run an Unpin() just in case. This is needed in case the process crashed or could not clean up a
+		// pin during a previous run.
+		if !ok && !isDelete {
+			e.managedInterfaces[ifaceName] = struct{}{}
+			e.c.Unpin(ifaceName)
 		}
-		ifId := ifList[0]
+		// Mark the interface as unmanaged if we get a delete request.
+		if ok && isDelete {
+			delete(e.managedInterfaces, ifaceName)
+		}
+
+		// Only attach to an interface if it is not managed yet.
+		// Otherwise, we'd get "can't create link: device or resource busy".
+		// Only detach from an interface if it is already managed.
+		if !ok && !isDelete || ok && isDelete {
+			logger.Info("Running attach / detach operation", "ifaceName", ifaceName, "isDelete", isDelete)
+			ifList, err := e.c.IngressNodeFwAttach([]string{ifaceName}, isDelete)
+			if err != nil {
+				logger.Error(err, "Fail to attach / detach ingress firewall prog",
+					"ifaceName", ifaceName, "isDelete", isDelete)
+				return err
+			}
+			ifID = ifList[0]
+		} else {
+			// Look up the network interface by name otherwise.
+			iface, err := net.InterfaceByName(ifaceName)
+			if err != nil {
+				return fmt.Errorf("lookup network iface %q: %s", ifaceName, err)
+			}
+			ifID = uint32(iface.Index)
+		}
 
 		for _, rule := range rules {
 			rule := rule.DeepCopy()
+			logger.Info("Adding failsafe rules", "ifaceName", ifaceName)
 			if err := addFailSaferules(&rule.FirewallProtocolRules); err != nil {
 				logger.Error(err, "Fail to load ingress firewall fail safe rules", "rule", rule)
 				return err
 			}
-			if err := c.IngressNodeFwRulesLoader(*rule, isDelete, ifId); err != nil {
-				logger.Error(err, "Fail to load ingress firewall rule", "rule", rule)
+			logger.Info("Running rules loader", "ifaceName", ifaceName, "isDelete", isDelete)
+			if err := e.c.IngressNodeFwRulesLoader(*rule, isDelete, ifID); err != nil {
+				logger.Error(err, "Fail to load/unload ingress firewall rule", "rule", rule, "isDelete", isDelete)
 				return err
 			}
 		}
+
+		/*
+			if ok && isDelete {
+				logger.Info("Running detach operation", "ifaceName", ifaceName)
+				_, err := e.c.IngressNodeFwAttach([]string{ifaceName}, isDelete)
+				if err != nil {
+					logger.Error(err, "Fail to detach ingress firewall prog")
+					return err
+				}
+			}*/
 	}
 
-	if r.stats != nil {
-		r.stats.StartPoll(c.GetStatisticsMap())
+	if e.stats != nil {
+		e.stats.StartPoll(e.c.GetStatisticsMap())
 	}
 
 	return nil
